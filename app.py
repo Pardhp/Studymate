@@ -7,7 +7,7 @@ RAG: PyMuPDF + Sentence-Transformers + FAISS; Local generation: transformers pip
 import re
 import json
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional, cast
+from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
 import numpy as np
@@ -18,11 +18,24 @@ import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
+import uuid
+from datetime import datetime
+
+# ---- Chat state ----
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "system", "content": "You are StudyMate, a helpful academic assistant."}]
+
+if "qa_log" not in st.session_state:
+    st.session_state.qa_log = []
+
+if "run_id" not in st.session_state:
+    st.session_state.run_id = uuid.uuid4().hex[:8]
+
 # ---------------- Config ----------------
 DEFAULT_CHUNK_SIZE = 1000
 DEFAULT_OVERLAP = 200
 DEFAULT_TOP_K = 5
-DEFAULT_MODEL_ID = "ibm-granite/granite-3.3-2b-instruct"  # change in sidebar if needed
+DEFAULT_MODEL_ID = "ibm-granite/granite-3.3-2b-instruct"
 MAX_CONTEXT_CHARS = 4000  # keep prompt reasonable
 
 # ---------------- Data ----------------
@@ -120,13 +133,40 @@ def format_context(retrieved: List[Tuple[Chunk, float]], max_chars: int = MAX_CO
         total += len(piece)
     return "\n".join(parts)
 
-# ---------------- Local LLM (transformers) ----------------
-def build_prompt(question: str, context: str) -> str:
-    return (
-        "You are a helpful academic assistant. Answer ONLY using the provided context.\n"
-        "If the context is insufficient, say so clearly.\n\n"
-        f"Question: {question}\n\nContext:\n{context}\n"
+# ---------- Chat helpers ---------- 
+def build_history_text(k: int = 6) -> str:
+    msgs = st.session_state.messages[1:]  # skip system
+    if not msgs:
+        return ""
+    tail = msgs[-k:] if len(msgs) > k else msgs
+    lines = []
+    for m in tail:
+        role = "User" if m["role"] == "user" else "Assistant"
+        lines.append(f"{role}: {m['content']}")
+    return "\n".join(lines)
+
+def with_context(user_text: str, retrieved_chunks: List[Tuple[Chunk, float]] | None) -> str:
+    if not retrieved_chunks:
+        return user_text
+    parts = []
+    total = 0
+    for (chunk, _) in retrieved_chunks:
+        piece = f"[p.{chunk.page_num} – {chunk.source_file}] {chunk.text}"
+        if total + len(piece) > MAX_CONTEXT_CHARS:
+            break
+        parts.append(piece)
+        total += len(piece)
+    ctx = "\n".join(parts)
+    return f"{user_text}\n\n---\nUse these sources when answering:\n{ctx}"
+
+# ---------------- Local LLM ----------------
+def build_prompt(question: str, context: str, history_text: str = "") -> str:
+    preface = (
+        "You are a helpful academic assistant. Use only the provided context and, if helpful, "
+        "the prior conversation to resolve follow-up references. If the context is insufficient, say so clearly.\n"
     )
+    hist = f"\nConversation so far:\n{history_text}\n" if history_text.strip() else ""
+    return f"{preface}{hist}\nQuestion: {question}\n\nContext:\n{context}\n"
 
 @st.cache_resource(show_spinner=True)
 def load_local_pipeline(
@@ -135,18 +175,13 @@ def load_local_pipeline(
     use_trust_remote_code: bool,
     dtype_choice: str,
 ):
-    """
-    Loads tokenizer + model and returns a text-generation pipeline.
-    device_map='auto' uses accelerate to place weights on available GPU/CPU.
-    """
-    # dtype selection
     dtype = None
     if dtype_choice == "float16":
         dtype = torch.float16
     elif dtype_choice == "bfloat16":
         dtype = torch.bfloat16
     elif dtype_choice == "float32":
-        dtype = torch.float32  # slowest / most compatible
+        dtype = torch.float32
 
     tok = AutoTokenizer.from_pretrained(
         model_id,
@@ -158,45 +193,33 @@ def load_local_pipeline(
         model_id,
         token=hf_token,
         torch_dtype=dtype,
-        device_map="auto",  # requires accelerate
+        device_map="auto",
         trust_remote_code=use_trust_remote_code,
         low_cpu_mem_usage=True,
     )
 
-    gen = pipeline(
-        "text-generation",
-        model=mdl,
-        tokenizer=tok,
-        # leave device=None so pipeline honors device_map on the model
-        # framework is torch
-    )
+    gen = pipeline("text-generation", model=mdl, tokenizer=tok)
     return gen, tok
 
-def call_local_llm(
+def call_local_llm_with_history(
     question: str,
     context: str,
     pipe,
     tok,
+    history_text: str = "",
     max_new_tokens: int = 512,
     temperature: float = 0.2,
     top_p: float = 0.95,
 ) -> str:
-    prompt = build_prompt(question, context[:MAX_CONTEXT_CHARS])
-
-    # Ensure prompt length fits; truncate if needed
+    prompt = build_prompt(question, context[:MAX_CONTEXT_CHARS], history_text)
     inputs = tok(
         prompt,
         return_tensors="pt",
         truncation=True,
         max_length=tok.model_max_length - max_new_tokens - 8,
     )
-    # Send tensors to the same device as the model’s first weight shard
-    if hasattr(pipe.model, "hf_device_map"):
-        first_device = next(iter(set(pipe.model.hf_device_map.values())))
-    else:
-        first_device = "cuda:0" if torch.cuda.is_available() else "cpu"
-    inputs = {k: v.to(pipe.model.device if hasattr(pipe.model, "device") else first_device) for k, v in inputs.items()}
-
+    device = pipe.model.device if hasattr(pipe.model, "device") else "cuda" if torch.cuda.is_available() else "cpu"
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     out = pipe.model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -208,8 +231,7 @@ def call_local_llm(
         repetition_penalty=1.05,
     )
     text = tok.decode(out[0], skip_special_tokens=True)
-    # Return only the completion after the prompt
-    return text[len(tok.decode(inputs["input_ids"][0], skip_special_tokens=True)) :].strip()
+    return text[len(tok.decode(inputs["input_ids"][0], skip_special_tokens=True)):].strip()
 
 # ---------------- Streamlit wiring ----------------
 def init_session_state():
@@ -217,30 +239,26 @@ def init_session_state():
         st.session_state["chunks"] = []
     if "index" not in st.session_state:
         st.session_state["index"] = None
-    if "qa_history" not in st.session_state:
-        st.session_state["qa_history"] = []
     if "embeddings" not in st.session_state:
         st.session_state["embeddings"] = None
+
+def local_css(file_name: str):
+    with open(file_name) as f:
+        st.markdown(f"<style>{f.read()}</style>", unsafe_allow_html=True)
 
 def main():
     st.set_page_config(page_title="Studymate (Local)", page_icon="📘", layout="wide")
     init_session_state()
+    local_css("styles.css")
 
+    # Sidebar
     with st.sidebar:
         st.header("⚙️ Local LLM Settings")
-        model_id = st.text_input(
-            "HF Model ID",
-            value=DEFAULT_MODEL_ID,
-            help="e.g., ibm-granite/granite-3.3-2b-instruct or ibm-granite/granite-3.0-2b-instruct",
-        )
-        hf_token = st.text_input(
-            "Hugging Face Token (read)",
-            type="password",
-            help="Required to download model weights the first time.",
-        )
-        trust_remote = st.checkbox("trust_remote_code (only if model readme says so)", value=False)
+        model_id = st.text_input("HF Model ID", value=DEFAULT_MODEL_ID)
+        hf_token = st.text_input("Hugging Face Token (read)", type="password")
+        trust_remote = st.checkbox("trust_remote_code", value=False)
         dtype_choice = st.selectbox("dtype", ["bfloat16", "float16", "float32"], index=0)
-        max_new_tokens = st.slider("Max new tokens", 64, 1024, 512, 64)
+        max_new_tokens = st.slider("Max new tokens", 64, 512, 64, 64)
         temperature = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05)
         top_p = st.slider("Top-p", 0.1, 1.0, 0.95, 0.05)
 
@@ -254,9 +272,11 @@ def main():
             st.session_state["index"] = None
             st.session_state["chunks"] = []
             st.session_state["embeddings"] = None
-            st.session_state["qa_history"] = []
+            st.session_state.messages = st.session_state.messages[:1]
+            st.session_state.qa_log = []
             st.experimental_rerun()
 
+    # Main UI
     st.title("📘 Studymate (Local Transformers)")
     st.caption("Ask your PDFs anything — RAG over local PDFs + local Granite (or other HF model)")
 
@@ -285,7 +305,7 @@ def main():
             st.error("No extractable text found.")
 
     st.divider()
-    st.header("💬 Ask a question")
+    st.header("💬 Chat")
 
     if not st.session_state["chunks"] or st.session_state["index"] is None:
         st.info("Upload and process PDFs first.")
@@ -299,40 +319,99 @@ def main():
         st.error(f"Failed to load local model: {e}")
         return
 
-    c1, c2 = st.columns([5, 1])
-    with c1:
-        question = st.text_input("Your question:", placeholder="e.g., Summarize section 2’s main idea")
-    with c2:
-        ask = st.button("🔍 Ask", type="primary", disabled=not bool(question))
+    left, right = st.columns([2, 1], gap="large")
 
-    if ask and question:
-        with st.spinner("Retrieving relevant chunks…"):
-            emb_model = load_embedding_model()
-            retrieved = query_index(question, st.session_state["index"], st.session_state["chunks"], emb_model, top_k)
-        if not retrieved:
-            st.error("No relevant content found.")
-            return
+    with left:
+        for m in st.session_state.messages[1:]:
+            who = "user" if m["role"] == "user" else "assistant"
+            st.chat_message(who).markdown(m["content"])
 
-        context = format_context(retrieved)
-        with st.spinner("Generating locally…"):
-            try:
-                answer = call_local_llm(question, context, gen, tok, max_new_tokens, temperature, top_p)
-            except Exception as e:
-                st.error(f"Local generation failed: {e}")
-                return
+        user_text = st.chat_input("Ask a question or a follow-up…")
+        if user_text:
+            with st.spinner("Retrieving relevant chunks…"):
+                emb_model = load_embedding_model()
+                retrieved = query_index(user_text, st.session_state["index"], st.session_state["chunks"], emb_model, top_k)
 
-        st.subheader("📖 Answer")
-        st.markdown(answer)
+            st.session_state.messages.append({"role": "user", "content": user_text})
+            st.chat_message("user").markdown(user_text)
 
-        qa_hist = cast(List[dict], st.session_state["qa_history"])
-        qa_hist.append({"question": question, "answer": answer, "chunks": retrieved})
+            if not retrieved:
+                st.chat_message("assistant").markdown("_I couldn't find relevant passages in the uploaded PDFs._")
+            else:
+                history_text = build_history_text(k=6)
+                with st.spinner("Generating locally…"):
+                    try:
+                        answer = call_local_llm_with_history(
+                            question=user_text,
+                            context=format_context(retrieved),
+                            pipe=gen,
+                            tok=tok,
+                            history_text=history_text,
+                            max_new_tokens=max_new_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                        )
+                    except Exception as e:
+                        answer = f"_Local generation failed: {e}_"
 
-        st.subheader("📚 References")
-        for i, (chunk, dist) in enumerate(retrieved, 1):
-            score = 1 / (1 + dist)
-            with st.expander(f"Ref {i} — {chunk.source_file} (p.{chunk.page_num}) • relevance≈{score:.3f}"):
-                txt = chunk.text
-                st.text(txt[:1000] + ("..." if len(txt) > 1000 else ""))
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+                st.chat_message("assistant").markdown(answer)
+
+                st.session_state.qa_log.append({
+                    "id": uuid.uuid4().hex[:6],
+                    "question": user_text,
+                    "answer": answer,
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "sources": [f"{c.source_file} (p.{c.page_num})" for (c, _) in retrieved]
+                })
+
+                st.subheader("📚 References")
+                for i, (chunk, dist) in enumerate(retrieved, 1):
+                    score = 1 / (1 + dist)
+                    with st.expander(f"Ref {i} — {chunk.source_file} (p.{chunk.page_num}) • relevance≈{score:.3f}"):
+                        txt = chunk.text
+                        st.text(txt[:1000] + ("..." if len(txt) > 1000 else ""))
+
+    with right:
+        st.subheader("Q&A History")
+        if not st.session_state.qa_log:
+            st.info("No questions yet. Your full conversation will appear here.")
+        else:
+            for row in reversed(st.session_state.qa_log):
+                with st.expander(f'[{row["time"]}] Q: {row["question"][:60]}', expanded=False):
+                    st.markdown(f'**Q:** {row["question"]}')
+                    st.markdown(f'**A:** {row["answer"]}')
+                    if row["sources"]:
+                        st.caption("Sources:")
+                        for s in row["sources"]:
+                            st.write(f"- {s}")
+
+            json_bytes = json.dumps(st.session_state.qa_log, ensure_ascii=False, indent=2).encode("utf-8")
+            st.download_button(
+                "Download Q&A (JSON)",
+                data=json_bytes,
+                file_name=f"studymate_log_{st.session_state.run_id}.json",
+                mime="application/json",
+            )
+
+            txt_blob = "\n\n".join(
+                [f'[{r["time"]}] Q: {r["question"]}\nA: {r["answer"]}' for r in st.session_state.qa_log]
+            ).encode("utf-8")
+            st.download_button(
+                "Download Q&A (TXT)",
+                data=txt_blob,
+                file_name=f"studymate_log_{st.session_state.run_id}.txt",
+                mime="text/plain",
+            )
+
+        st.divider()
+        if st.button("Clear Current Chat"):
+            st.session_state.messages = st.session_state.messages[:1]
+            st.toast("Chat cleared.")
+        if st.button("Clear Q&A History"):
+            st.session_state.qa_log = []
+            st.toast("History cleared.")
+
 
 if __name__ == "__main__":
     main()

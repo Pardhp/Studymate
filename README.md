@@ -18,6 +18,4 @@ Local LLM generation using transformers (Granite or any HF model)
 
 Chat-style conversation with follow-ups and conversation memory
 
-Light/Dark theme, high-contrast UI, green primary accents
-
 Downloadable chat history (JSON)

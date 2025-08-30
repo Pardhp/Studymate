@@ -1,0 +1,38 @@
+:root{
+  --brand:#7C3AED;      /* purple */
+  --brand-2:#06B6D4;    /* teal */
+  --bg:#0F172A;
+  --panel:#111827;
+  --text:#F8FAFC;
+  --muted:#9CA3AF;
+  --chip:#1F2937;
+}
+
+/* Hide default Streamlit menu/footer */
+#MainMenu, header {visibility: hidden;}
+footer {visibility: hidden;}
+
+.stApp {
+  background: linear-gradient(135deg, rgba(124,58,237,.10), rgba(6,182,212,.08));
+}
+
+.stChatMessage > div {
+  border-radius: 16px !important;
+  padding: .75rem 1rem !important;
+  border: 1px solid rgba(255,255,255,.06);
+  box-shadow: 0 6px 18px rgba(0,0,0,.25);
+}
+
+.stChatMessage.user > div { 
+  background: rgba(124,58,237,.18);
+}
+
+.stChatMessage.assistant > div { 
+  background: rgba(6,182,212,.16);
+}
+
+.stButton > button {
+  border-radius: 12px !important;
+  font-weight: 600;
+  border: 1px solid rgba(255,255,255,.08);
+}
